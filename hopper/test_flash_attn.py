@@ -7,7 +7,8 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from flash_attn.bert_padding import pad_input, unpad_input
 
-from flash_attn_interface import flash_attn_func, flash_attn_varlen_func
+from flash_attn_interface import flash_attn_func, flash_attn_varlen_func, _flash_attn_varlen_forward
+from utils.test_tensors import TestTensors
 
 ABS_TOL = 5e-3
 REL_TOL = 1e-1
@@ -672,3 +673,140 @@ def test_flash_attn_varlen_output(
         assert (dq - dq_ref).abs().max().item() <= multiple * (dq_pt - dq_ref).abs().max().item()
         assert (dk - dk_ref).abs().max().item() <= multiple * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= multiple * (dv_pt - dv_ref).abs().max().item()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+# @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+# @pytest.mark.parametrize("dtype", [torch.bfloat16])
+# @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+# @pytest.mark.parametrize("mha_type", ["mha"])
+# @pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("deterministic", [False])
+@pytest.mark.parametrize("softcap", [0.0, 50.0])
+# @pytest.mark.parametrize("softcap", [50.0])
+@pytest.mark.parametrize("causal,local", [(False, False), (True, False), (False, True)])
+# @pytest.mark.parametrize("causal,local", [(False, False)])
+# @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
+# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192, 256])
+# @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
+# @pytest.mark.parametrize('d', [56, 80])
+# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
+# @pytest.mark.parametrize("d", [64, 96, 128])
+@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (64, 128),
+        (128, 128),
+        (256, 256),
+        (113, 203),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (384, 256),
+        (640, 128),
+        (512, 256),
+        (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (2048, 2048),
+        (8192, 8192),
+    ],
+)
+# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
+def test_flash_attn_varlen_paged_output(
+        seqlen_q, seqlen_k, d, causal, local, softcap, deterministic, mha_type, dtype
+):
+    if softcap > 0.0 and dtype == torch.float8_e4m3fn:
+        pytest.skip("Softcap is not supported for float8_e4m3fn")
+    device = "cuda"
+    # set seed
+    torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal))
+    # batch_size = 40
+    # nheads = 16
+    batch_size = 8 if seqlen_q <= 2048 else 1
+    nheads = 6
+    # batch_size = 2
+    # nheads = 2
+    nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+    dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
+    q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref).requires_grad_()
+    if softcap > 0.0:
+        # Ensure the values of qk are at least within softcap range.
+        q_ref = (q_ref * softcap / 2).detach().requires_grad_()
+        
+    t = TestTensors.generate(
+        dtype=dtype,
+        batch_size=batch_size,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_kv=seqlen_k,
+        nheads_q=nheads,
+        nheads_kv=nheads_kv,
+        headdim=d,
+        device=device,
+        page_size=32,
+        randomize_page_order=True
+    )
+
+    out_unpad, _, _, _, out_padded, lse  = _flash_attn_varlen_forward(
+        t.q_unpad,
+        t.k_paged,
+        t.v_paged,
+        t.cu_seqlens_q,
+        t.cu_seqlens_k,
+        t.max_seqlen_q,
+        t.max_seqlen_k,
+        softmax_scale=t.softmax_scale,
+        causal=causal,
+        block_table=t.page_table,
+        q_scale=t.descale_q, 
+        k_scale=t.descale_k, 
+        v_scale=t.descale_v,
+        window_size=(-1, -1),
+        softcap=softcap,
+    )
+    out = pad_input(out_unpad, t.indices_q, t.batch_size, t.max_seqlen_q)
+    torch.testing.assert_close(out, out_padded.reshape(batch_size, -1, nheads, d), rtol=1e-3, atol=1e-3)
+
+    out_ref, attn_ref = attention_ref(
+        t.q,
+        t.k,
+        t.v,
+        t.query_padding_mask,
+        t.key_padding_mask,
+        causal=causal,
+        q_scale=t.descale_q, 
+        k_scale=t.descale_k, 
+        v_scale=t.descale_v,
+        window_size=(-1, -1),
+        softcap=softcap
+    )
+    out_pt, attn_pt = attention_ref(
+        t.q,
+        t.k,
+        t.v,
+        t.query_padding_mask,
+        t.key_padding_mask,
+        causal=causal,
+        q_scale=t.descale_q, 
+        k_scale=t.descale_k, 
+        v_scale=t.descale_v,
+        window_size=(-1, -1),
+        softcap=softcap,
+        upcast=False,
+        reorder_ops=True,
+        intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
+    )
+
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+    print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+
+    # Check that FlashAttention's numerical error is at most twice the numerical error
+    # of a Pytorch implementation.
+    max_pt_error = (out_pt - out_ref).abs().max().item()
+    assert (out - out_ref).abs().max().item() <= 2 * max_pt_error
+    #torch.testing.assert_close(out, out_ref, atol=2*max_pt_error, rtol=0)

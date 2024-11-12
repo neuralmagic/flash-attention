@@ -14,7 +14,8 @@
 #include "static_switch.h"
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
-#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
+#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ "), got ",\
+                                        x.sizes(), " expected ", torch::IntArrayRef({__VA_ARGS__}))
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
 void set_params_fprop(Flash_fwd_params &params,
@@ -37,6 +38,7 @@ void set_params_fprop(Flash_fwd_params &params,
                       void *cu_seqlens_k_d,
                       void *seqused_q,
                       void *seqused_k,
+                      const c10::optional<at::Tensor>& block_table,
                       void *p_d,
                       void *softmax_lse_d,
                       float p_dropout,
@@ -83,6 +85,12 @@ void set_params_fprop(Flash_fwd_params &params,
     params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
     params.seqused_q = static_cast<int *>(seqused_q);
     params.seqused_k = static_cast<int *>(seqused_k);
+    
+    if (block_table) {
+        params.block_table = static_cast<int *>(block_table->data_ptr<int>());
+        params.block_table_batch_stride = block_table->stride(0);
+        params.page_block_size = k.size(1);
+    }
 
     // P = softmax(QK^T)
     params.p_ptr = p_d;
@@ -187,6 +195,7 @@ void set_params_dgrad(Flash_bwd_params &params,
                      cu_seqlens_k_d,
                      seqused_q,
                      seqused_k,
+                     /*block_table=*/c10::nullopt,
                      nullptr,
                      softmax_lse_d,
                      p_dropout,
@@ -381,6 +390,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                      /*cu_seqlens_k_d=*/nullptr,
                      /*seqused_q_=*/nullptr,
                      /*seqused_k=*/nullptr,
+                     /*block_table=*/c10::nullopt,
                      nullptr,
                      softmax_lse.data_ptr(),
                      /*p_dropout=*/0.f,
@@ -446,6 +456,7 @@ mha_varlen_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
                const at::Tensor &cu_seqlens_k,  // b+1
                c10::optional<at::Tensor> &seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
                c10::optional<at::Tensor> &seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
+               c10::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
                int const max_seqlen_q,
                int const max_seqlen_k,
                const float softmax_scale,
@@ -461,6 +472,8 @@ mha_varlen_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
     TORCH_CHECK(is_sm90, "FlashAttention only supports Hopper GPUs or newer.");
+
+    bool const use_paged_kv = block_table_.has_value();
 
     auto q_type = q.scalar_type();
     TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16 || q_type == at::ScalarType::Float8_e4m3fn,
@@ -482,9 +495,11 @@ mha_varlen_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
     const int batch_size = cu_seqlens_q.numel() - 1;
     int num_heads = sizes[1];
     const int head_size_og = sizes[2];
-    const int num_heads_k = k.size(1);
+    const int num_heads_k = k.size(-2);
+    const int num_pages = use_paged_kv ? k.sizes()[0] : 0;
+    const int page_size = use_paged_kv ? k.sizes()[1] : 0;
     const int total_q = q.sizes()[0];
-    const int total_k = k.sizes()[0];
+    const int total_k = use_paged_kv ? num_pages * page_size : k.sizes()[0];
     TORCH_CHECK(head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
     if (softcap > 0.0) { TORCH_CHECK(q_type != at::ScalarType::Float8_e4m3fn, "Softcap is not yet supported for fp8_e4m3 data type"); }
@@ -497,8 +512,21 @@ mha_varlen_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
     }
 
     CHECK_SHAPE(q, total_q, num_heads, head_size_og);
-    CHECK_SHAPE(k, total_k, num_heads_k, head_size_og);
-    CHECK_SHAPE(v, total_k, num_heads_k, head_size_og);
+    if (use_paged_kv) {
+        TORCH_CHECK(block_table_->is_contiguous());
+        TORCH_CHECK(block_table_->dtype() == torch::kInt32);
+        TORCH_CHECK(block_table_->stride(0) % block_table_->stride(1) == 0,
+            "block_table must be trivially partitionable along dim 1 (page_size)"
+            " this is so we can break the pages up into subpages for the TMA copies");
+        TORCH_CHECK(page_size % kMaxSubPageSize == 0,
+            "Page size must be a multiple of ", kMaxSubPageSize, " for TMA copies");
+        CHECK_SHAPE(k, num_pages, page_size, num_heads_k, head_size_og);
+        CHECK_SHAPE(v, num_pages, page_size, num_heads_k, head_size_og);
+    } else {
+        CHECK_SHAPE(k, total_k, num_heads_k, head_size_og);
+        CHECK_SHAPE(v, total_k, num_heads_k, head_size_og);
+    }
+
     CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
     CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
 
@@ -563,8 +591,9 @@ mha_varlen_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
                      q_padded, k_padded, v_padded, out,
                      cu_seqlens_q.data_ptr(),
                      cu_seqlens_k.data_ptr(),
-                     seqused_q_.has_value() ? seqused_q_.value().data_ptr() : nullptr,
-                     seqused_k_.has_value() ? seqused_k_.value().data_ptr() : nullptr,
+                     seqused_q_ ? seqused_q_->data_ptr() : nullptr,
+                     seqused_k_ ? seqused_k_->data_ptr() : nullptr,
+                     block_table_,
                      nullptr,
                      softmax_lse.data_ptr(),
                      /*p_dropout=*/0.f,

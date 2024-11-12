@@ -34,6 +34,7 @@ def _flash_attn_forward(q, k, v, softmax_scale, causal,
 
 
 def _flash_attn_varlen_forward(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, causal,
+                               block_table=None,
                                q_scale=None, k_scale=None, v_scale=None,
                                window_size=(-1, -1), softcap=0.0):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
@@ -43,7 +44,7 @@ def _flash_attn_varlen_forward(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q
         k,
         v,
         None,
-        cu_seqlens_q, cu_seqlens_k, None, None, max_seqlen_q, max_seqlen_k,
+        cu_seqlens_q, cu_seqlens_k, None, None, block_table, max_seqlen_q, max_seqlen_k,
         softmax_scale,
         causal,
         q_scale, k_scale, v_scale,

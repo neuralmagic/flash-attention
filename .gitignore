@@ -25,3 +25,5 @@ var/
 
 # Dev
 venv
+*.png
+*.pkl

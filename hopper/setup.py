@@ -167,6 +167,7 @@ if not SKIP_CUDA_BUILD:
         # Path(this_dir) / "fmha-pipeline",
         # repo_dir / "lib",
         # repo_dir / "include",
+        repo_dir / "hopper",
         cutlass_dir / "include",
         # cutlass_dir / "examples" / "common",
         # cutlass_dir / "tools" / "util" / "include",

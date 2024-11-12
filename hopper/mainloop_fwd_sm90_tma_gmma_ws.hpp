@@ -14,15 +14,45 @@
 
 #include "cutlass/gemm/collective/collective_builder.hpp"
 
+#include "cutlass_extension/cute/atom/copy_traits_sm90_tma.hpp"
+#include "cutlass_extension/cute/layout_composed.hpp"
+#include "cutlass_extension/cute/paged_mode.hpp"
+#include "cutlass_extension/cute/tensor_impl.hpp"
+#include "flash.h"
 #include "named_barrier.hpp"
 #include "utils.h"
 
-namespace flash {
-
 using namespace cute;
 
+namespace flash
+{
+
+// In-order to support Use_pagedKV we want to intecept tma copies that involve
+//  a composed layout (i.e. composed with PagedMode) and tag the atoms to 
+//  use `TMA_LOAD_Unpack_Composed` in 
+//  `cutlass_extension/cute/atom/copy_traits_sm90_tma.hpp` instead of 
+//  `TMA_LOAD_Unpack` in `cute/atom/copy_traits_sm90_tma.hpp`.
+template <class CopyOp,
+          class... CopyArgs,
+          class CopyInternalType,
+          class SrcEngine, class A, class O, class B,
+          class DstEngine, class DstLayout>
+CUTE_HOST_DEVICE
+std::enable_if_t<
+    std::is_same_v<CopyOp, SM90_TMA_LOAD_OP> ||
+    std::is_same_v<CopyOp, SM90_TMA_LOAD_MULTICAST_OP>, 
+void>
+copy(Copy_Atom<Copy_Traits<CopyOp, CopyArgs...>, CopyInternalType> const& atom,
+     Tensor<SrcEngine, ComposedLayout<A, O, B>>                    const& src,
+     Tensor<DstEngine, DstLayout>                                      && dst)
+{
+    cute::copy(convert_tma_atom_to_support_compound_layouts(atom), 
+                    src, std::move(dst));
+}
+
+
 template <int Stages, class ClusterShape_, class TileShape_MNK_, class Element_, class ElementAccum_, class ArchTag_,
-        bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool V_colmajor_>
+        bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool Use_pagedKV_, bool V_colmajor_>
 struct CollectiveMainloopFwd {
 
     static constexpr int kStages = Stages;
@@ -36,9 +66,14 @@ struct CollectiveMainloopFwd {
     static constexpr bool Is_local = Is_local_;
     static constexpr bool Has_softcap = Has_softcap_;
     static constexpr bool Varlen = Varlen_;
+    static constexpr bool Use_pagedKV = Use_pagedKV_;
     static constexpr bool V_colmajor = V_colmajor_;
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
+
+    static constexpr int kSubPageSize = 
+        size<1>(TileShape_MNK{}) % kMaxSubPageSize == 0 ? kMaxSubPageSize : kMaxSubPageSize / 2;
+    static_assert(!Use_pagedKV || size<1>(TileShape_MNK{}) % kSubPageSize == 0);
 
     static_assert(ArchTag::kMinComputeCapability >= 90);
     static_assert(get<1>(ClusterShape{}) == 1 && get<2>(ClusterShape{}) == 1);
@@ -68,12 +103,26 @@ struct CollectiveMainloopFwd {
         SmemLayoutAtomK{},
         make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
 
+    using TMATileShape_N = std::conditional_t<Use_pagedKV, Int<kSubPageSize>, Int<int(size<1>(TileShape_MNK{}))>>;
+
+    // Shape is (N, K, _1, Stages) or if PagedKV (sub_page_size, K, sub_page, Stages)
+    // For now for in `load_fp8_transpose_V` we don't support PagedKV so use orig shape (N, K, Stages) instead
+    using SmemLayoutK_TMA = std::conditional_t<!Is_FP8 || V_colmajor,
+        decltype(select<0, 2, 1, 3>(tiled_divide(SmemLayoutK{}, Tile<TMATileShape_N>{}))),
+        SmemLayoutK>;
+
     using SmemLayoutAtomVt = decltype(cutlass::gemm::collective::detail::ss_smem_selector<TmaMajorV, Element,
         decltype(cute::get<2>(TileShape_MNK{})), decltype(cute::get<1>(TileShape_MNK{}))>());
     using SmemLayoutVt = decltype(tile_to_shape(
         SmemLayoutAtomVt{},
         make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{}), Int<kStages>{}),
         std::conditional_t<TmaMajorV == GMMA::Major::K, cute::Step<_1, _2, _3>, cute::Step<_2, _1, _3>>{}));
+
+    // Shape is (K, N, _1, Stages) or if PagedKV (K, page_size, sub_page, Stages)
+    // For now for in `load_fp8_transpose_V` we don't support PagedKV so use orig shape (K, N, Stages) instead
+    using SmemLayoutVt_TMA = std::conditional_t<!Is_FP8 || V_colmajor,
+        decltype(select<2, 0, 1, 3>(tiled_divide(select<1, 0, 2>(SmemLayoutVt{}), Tile<TMATileShape_N>{}))),
+        SmemLayoutVt>;
 
     using SmemLayoutAtomVtMma = decltype(cutlass::gemm::collective::detail::ss_smem_selector<MmaMajorV, Element,
         decltype(cute::get<2>(TileShape_MNK{})), decltype(cute::get<1>(TileShape_MNK{}))>());
@@ -116,30 +165,58 @@ struct CollectiveMainloopFwd {
     using GmemTiledCopyQ = cute::SM90_TMA_LOAD;
     using GmemTiledCopyKV = decltype(cutlass::gemm::collective::detail::sm90_cluster_shape_to_tma_atom(shape<0>(ClusterShape{})));
 
-    using ShapeQKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d, head, batch)
-    using StrideQK = cute::Stride<int64_t, _1, int64_t, int64_t>;
-    using StrideV = std::conditional_t<!V_colmajor, StrideQK, cute::Stride<_1, int64_t, int64_t, int64_t>>;
+    // LayoutQ (seqlen, headdim, n_heads, batch)
+    using ShapeQ = cute::Shape<int32_t, int32_t, int32_t, int32_t>;
+    using StrideQ = cute::Stride<int64_t, _1, int64_t, int64_t>;
+
+    using PageShape = Shape<Int<kSubPageSize>, int32_t>;
+    using KVSeqlenShape = typename std::conditional_t<Use_pagedKV, PageShape, int32_t>;
+    using KVSeqlenStride = typename std::conditional_t<Use_pagedKV, Stride<int64_t, int64_t>, int64_t>;
+    using KVBatchShape = typename std::conditional_t<Use_pagedKV, _1, int32_t>;
+    using KVBatchStride = typename std::conditional_t<Use_pagedKV, _0, int64_t>;
+
+    // if !Use_pagedKV:
+    //   LayoutKV (seqlen, headdim, n_heads, batch)
+    // else:
+    //   LayoutKV ((page_size, num_pages), headdim, n_heads, _1)
+    using ShapeKV = cute::Shape<KVSeqlenShape, int32_t, int32_t, KVBatchShape>;
+    using StrideK = cute::Stride<KVSeqlenStride, _1, int64_t, KVBatchStride>;
+    static_assert(!Use_pagedKV || !V_colmajor, "Paged KV is not supported with V_colmajor");
+    using StrideV = std::conditional_t<!V_colmajor, StrideK, cute::Stride<_1, int64_t, int64_t, int64_t>>;
 
     using TMA_Q = decltype(make_tma_copy_A_sm90(
         GmemTiledCopyQ{},
-        make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQKV{}, StrideQK{}),
+        make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQ{}, StrideQ{}),
         SmemLayoutQ{},
         TileShape_MNK{},
         ClusterShape{}));
 
-    using TMA_K = decltype(make_tma_copy_B_sm90(
-        GmemTiledCopyKV{},
-        make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQKV{}, StrideQK{}),
-        take<0, 2>(SmemLayoutK{}),
-        TileShape_MNK{},
-        ClusterShape{})); // mcast along M mode for this N load, if any
+    using StrideVt = decltype(select<1, 0, 2, 3>(StrideV{}));
+    using ShapeVt = decltype(select<1, 0, 2, 3>(ShapeKV{}));
 
-    using TMA_V = decltype(make_tma_copy(
-        GmemTiledCopyKV{},
-        make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQKV{}, select<1, 0, 2, 3>(StrideV{})),
-        take<0, 2>(SmemLayoutVt{}),
-        select<2, 1>(TileShape_MNK{}),
-        size<0>(ClusterShape{}))); // mcast along M mode for this N load, if any
+    using GmemTensorK = decltype(make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeKV{}, StrideK{}));
+    using GmemTensorVt = decltype(make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeVt{}, StrideVt{}));
+
+    static constexpr auto make_tma_copy_K(GmemTensorK t = {}) {
+        return make_tma_copy(
+            GmemTiledCopyKV{},
+            t,
+            take<0, 2>(SmemLayoutK_TMA{}),
+            make_shape(size<0>(SmemLayoutK_TMA{}), size<1>(SmemLayoutK_TMA{})),
+            size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
+    }
+
+    static constexpr auto make_tma_copy_Vt(GmemTensorVt t = {}) {
+        return make_tma_copy(
+            GmemTiledCopyKV{},
+            t,
+            take<0, 2>(SmemLayoutVt_TMA{}),
+            make_shape(size<0>(SmemLayoutVt_TMA{}), size<1>(SmemLayoutVt_TMA{})), // convert MNK to KN
+            size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
+    }
+
+    using TMA_K = decltype(make_tma_copy_K());
+    using TMA_V = decltype(make_tma_copy_Vt()); 
 
     // Set the bytes transferred in this TMA transaction (may involve multiple issues)
     static constexpr uint32_t TmaTransactionBytesQ = static_cast<uint32_t>(size(SmemLayoutQ{}) * cutlass::sizeof_bits_v<Element> / 8);
@@ -178,11 +255,11 @@ struct CollectiveMainloopFwd {
     // Host side kernel arguments
     struct Arguments {
         Element const* ptr_Q;
-        ShapeQKV const shape_Q;
-        StrideQK const stride_Q;
+        ShapeQ const shape_Q;
+        StrideQ const stride_Q;
         Element const* ptr_K;
-        ShapeQKV const shape_K;
-        StrideQK const stride_K;
+        ShapeKV const shape_K;
+        StrideK const stride_K;
         Element const* ptr_V;
         StrideV const stride_V;
         float const softmax_scale;
@@ -193,12 +270,15 @@ struct CollectiveMainloopFwd {
         int const* cu_seqlens_k = nullptr;
         int const* seqused_q = nullptr;
         int const* seqused_k = nullptr;
+        int const* block_table = nullptr;
+        int64_t const block_table_batch_stride = 0;
+        int const page_size = 0;
     };
 
     // Device side kernel params
     struct Params {
-        ShapeQKV const shape_Q;
-        ShapeQKV const shape_K;
+        ShapeQ const shape_Q;
+        ShapeKV const shape_K;
         cutlass::FastDivmod qhead_per_khead_divmod;
         TMA_Q tma_load_Q;
         TMA_K tma_load_K;
@@ -211,6 +291,9 @@ struct CollectiveMainloopFwd {
         int const* cu_seqlens_k = nullptr;
         int const* seqused_q = nullptr;
         int const* seqused_k = nullptr;
+        int const* block_table = nullptr;
+        int64_t const block_table_batch_stride = 0;
+        cutlass::FastDivmod subpages_per_page_divmod = cutlass::FastDivmod(1);
     };
 
     static Params
@@ -223,22 +306,19 @@ struct CollectiveMainloopFwd {
             TileShape_MNK{},
             ClusterShape{}); // no mcast for Q
         Tensor mK = make_tensor(make_gmem_ptr(args.ptr_K), args.shape_K, args.stride_K);
-        TMA_K tma_load_K = make_tma_copy_B_sm90(
-            GmemTiledCopyKV{},
-            mK,
-            take<0, 2>(SmemLayoutK{}),
-            TileShape_MNK{},
-            ClusterShape{}); // mcast along M mode for this N load, if any
+        TMA_K tma_load_K = make_tma_copy_K(mK);
         Tensor mVt = make_tensor(make_gmem_ptr(args.ptr_V), select<1, 0, 2, 3>(args.shape_K), select<1, 0, 2, 3>(args.stride_V));
-        TMA_V tma_load_V = make_tma_copy(
-            GmemTiledCopyKV{},
-            mVt,
-            take<0, 2>(SmemLayoutVt{}),
-            select<2, 1>(TileShape_MNK{}),
-            size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
+        TMA_V tma_load_V = make_tma_copy_Vt(mVt);
+
         if constexpr (Varlen) {
             assert(args.cu_seqlens_q != nullptr && args.cu_seqlens_k != nullptr);
         }
+
+        if constexpr (Use_pagedKV) {
+            assert(args.page_size > 0);
+            assert(args.page_size % kSubPageSize == 0);
+        }
+
         // If there's tanh softcapping, we do tanh(scores * softmax_scale / softcap_val) * softcap_val.
         // Right after this, we multiply by log2(e) before applying exp2.
         // To reduce the number of instructions, we instead pre-multiply softmax_scale / softcap_val
@@ -252,7 +332,10 @@ struct CollectiveMainloopFwd {
                 args.ptr_q_scale, args.ptr_k_scale, args.ptr_v_scale,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.window_size_left, args.window_size_right,
-                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k};
+                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k,
+                args.block_table,
+                args.block_table_batch_stride,
+                cutlass::FastDivmod((Use_pagedKV ? args.page_size / kSubPageSize : 1))};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -265,7 +348,7 @@ struct CollectiveMainloopFwd {
 
     CUTLASS_DEVICE
     int get_seqlen_q(Params const& params, int bidb) {
-        if constexpr (!Varlen) {
+        if constexpr (!Varlen && !Use_pagedKV) {
             return get<0>(params.shape_Q);
         } else {
             return params.seqused_q ? params.seqused_q[bidb] : params.cu_seqlens_q[bidb + 1] - params.cu_seqlens_q[bidb];
@@ -274,7 +357,7 @@ struct CollectiveMainloopFwd {
 
     CUTLASS_DEVICE
     int get_seqlen_k(Params const& params, int bidb) {
-        if constexpr (!Varlen) {
+        if constexpr (!Varlen && !Use_pagedKV) {
             return get<0>(params.shape_K);
         } else {
             return params.seqused_k ? params.seqused_k[bidb] : params.cu_seqlens_k[bidb + 1] - params.cu_seqlens_k[bidb];
@@ -321,8 +404,8 @@ struct CollectiveMainloopFwd {
          ) {
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
-        Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
-        Tensor sVt = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVt{});
+        Tensor sK_tma = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK_TMA{});
+        Tensor sVt_tma = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVt_TMA{});
 
         auto [m_block, bidh, bidb] = block_coord;
         int bidh_kv = params.qhead_per_khead_divmod.divide(bidh);
@@ -332,21 +415,56 @@ struct CollectiveMainloopFwd {
         constexpr uint32_t cluster_shape_x = get<0>(ClusterShape());
         uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
         Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, !Varlen ? bidb : 0);
-        Tensor mK = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, !Varlen ? bidb : 0);
-        Tensor mVt = params.tma_load_V.get_tma_tensor(select<1, 0, 2, 3>(params.shape_K))(_, _, bidh_kv, !Varlen ? bidb : 0);
+        Tensor mK_ = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, !Varlen ? bidb : 0);
+        Tensor mVt_ = params.tma_load_V.get_tma_tensor(select<1, 0, 2, 3>(params.shape_K))(_, _, bidh_kv, !Varlen ? bidb : 0);
 
+        // Compose with PagedMode if we are using a paged KV
+        auto mK = [&, bidb = bidb]() {
+            if constexpr(Use_pagedKV)
+                // mK_: ((sub_page_size, sub_page), headdim, n_heads, _1) 
+                return make_mode_paged<0, 1>(mK_, 
+                    &params.block_table[params.block_table_batch_stride * bidb],
+                    params.subpages_per_page_divmod);
+            else return mK_; }();
+        auto mVt = [&, bidb = bidb]() {
+            if constexpr(Use_pagedKV)
+                // mVt_: (headdim, (sub_page_size, sub_page), n_heads, _1) 
+                return make_mode_paged<1, 1>(mVt_,
+                    &params.block_table[params.block_table_batch_stride * bidb],
+                    params.subpages_per_page_divmod);
+            else return mVt_;  }();
+
+        auto get_kv_seq_len_offset = [&, bidb=bidb]() {
+            if constexpr (!Varlen || Use_pagedKV) return _0{};
+            else return params.cu_seqlens_k[bidb];
+        };
+            
         Tensor gQ = local_tile(domain_offset(make_coord(!Varlen ? 0 : params.cu_seqlens_q[bidb], _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
-        Tensor gK = local_tile(domain_offset(make_coord(!Varlen ? 0 : params.cu_seqlens_k[bidb], _0{}), mK), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
-        Tensor gVt = local_tile(domain_offset(make_coord(_0{}, !Varlen ? 0 : params.cu_seqlens_k[bidb]), mVt), select<2, 1>(TileShape_MNK{}), make_coord(_0{}, _));  // (K, N, _)
+        Tensor gK = local_tile(domain_offset(make_coord(get_kv_seq_len_offset(), _0{}), mK), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
+        Tensor gVt = local_tile(domain_offset(make_coord(_0{}, get_kv_seq_len_offset()), mVt), select<2, 1>(TileShape_MNK{}), make_coord(_0{}, _));  // (K, N, _)
+
+        /* Split the K and Vt TMA loads along N into chunks of size TMATileShape_N, 
+         * when using paged attention this corresponds to the sub-page size, 
+         * otherwise it corresponds to the N dimension of the tile (resulting in 
+         * a single chunk). The number of chunks is TMA_N_CPY */
+        // gK                                     =  (N, K, _)
+        // tiled_divide(gK, Int<kSubPageSize>{})  -> (TMA_N_VAL, TMA_N_CPY, K, _)
+        // select<0, 2, 1, 3>(...)                -> (TMA_N_VAL, K, TMA_N_CPY, _)
+        Tensor gK_tma = select<0, 2, 1, 3>(tiled_divide(gK, make_tile(TMATileShape_N{})));
+        // gVt                                    =  (K, N, _)
+        // select<1, 0, 2>(gVt)                   -> (N, K, _)
+        // tiled_divide(..., Int<kSubPageSize>{}) -> (TMA_N_VAL, TMA_N_CPY, K, _)
+        // select<2, 0, 1, 3>(...)                -> (K, TMA_N_VAL, TMA_N_CPY, _)
+        Tensor gVt_tma = select<2, 0, 1, 3>(tiled_divide(select<1, 0, 2>(gVt), make_tile(TMATileShape_N{})));
 
         Tensor sQ_x = make_tensor(sQ.data(), make_layout(sQ.layout(), Layout<_1>{}));
         Tensor gQ_x = make_tensor(gQ.data(), make_layout(gQ.layout(), Layout<_1>{}));
         auto [tQgQ, tQsQ] = tma_partition(params.tma_load_Q, _0{}, Layout<_1>{},
                                           group_modes<0, 2>(sQ_x), group_modes<0, 2>(gQ_x));  // (TMA), (TMA)
         auto [tKgK, tKsK] = tma_partition(params.tma_load_K, block_rank_in_cluster, Layout<ClusterShape>{},
-                                          group_modes<0, 2>(sK), group_modes<0, 2>(gK));  // (TMA, k), (TMA, PIPE)
+                                          group_modes<0, 2>(sK_tma), group_modes<0, 2>(gK_tma));  // (TMA, TMA_N_CPY, k), (TMA, TMA_N_CPY, PIPE)
         auto [tVgVt, tVsVt] = tma_partition(params.tma_load_V, block_rank_in_cluster, Layout<ClusterShape>{},
-                                          group_modes<0, 2>(sVt), group_modes<0, 2>(gVt));  // (TMA, k), (TMA, PIPE)
+                                          group_modes<0, 2>(sVt_tma), group_modes<0, 2>(gVt_tma));  // (TMA, TMA_N_CPY, k), (TMA, TMA_N_CPY, PIPE)
 
         uint16_t mcast_mask_kv = 0;
         if constexpr (cute::is_same_v<GmemTiledCopyKV, SM90_TMA_LOAD_MULTICAST>) {
@@ -361,14 +479,19 @@ struct CollectiveMainloopFwd {
         int n_block = n_block_max - 1;
 
         int lane_predicate = cute::elect_one_sync();
-        if (lane_predicate) {
+        int laneid = cutlass::canonical_lane_idx();
+
+        static int constexpr kCopyIters = size<1>(TileShape_MNK{}) / TMATileShape_N{};
+        static_assert(kCopyIters <= 32, "kCopyItersV must be <= 32");
+
+        if (laneid < kCopyIters) {
             pipeline_k.producer_acquire(smem_pipe_write);
             if constexpr (size(ClusterShape{}) == 1) {
                 copy(params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
-                    tKgK(_, n_block), tKsK(_, smem_pipe_write.index()));
+                    tKgK(_, laneid, n_block), tKsK(_, laneid, smem_pipe_write.index()));
             } else {
                 copy(params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
-                    tKgK(_, n_block), tKsK(_, smem_pipe_write.index()));
+                    tKgK(_, laneid, n_block), tKsK(_, laneid, smem_pipe_write.index()));
             }
         }
 
@@ -386,8 +509,7 @@ struct CollectiveMainloopFwd {
         // TMA store on O first, call TMA multicast load on V, before CTA 1 can finishing TMA store on O.
         shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
 
-        if (lane_predicate) {
-            // CUTLASS_PRAGMA_NO_UNROLL
+        if (laneid < kCopyIters) {
             #pragma unroll 2
             for (; n_block > n_block_min; --n_block) {
                 PipelineState smem_pipe_write_v = smem_pipe_write; // copy the state, write_v is always 1 step behind
@@ -395,30 +517,30 @@ struct CollectiveMainloopFwd {
                 pipeline_k.producer_acquire(smem_pipe_write);
                 if constexpr (size(ClusterShape{}) == 1) {
                     copy(params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
-                        tKgK(_, n_block - 1), tKsK(_, smem_pipe_write.index()));
+                        tKgK(_, laneid, n_block - 1), tKsK(_, laneid, smem_pipe_write.index()));
                 } else {
                     copy(params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
-                        tKgK(_, n_block - 1), tKsK(_, smem_pipe_write.index()));
+                        tKgK(_, laneid, n_block - 1), tKsK(_, laneid, smem_pipe_write.index()));
                 }
                 pipeline_v.producer_acquire(smem_pipe_write_v);
                 if constexpr (size(ClusterShape{}) == 1) {
                     copy(params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
-                        tVgVt(_, n_block), tVsVt(_, smem_pipe_write_v.index()));
+                        tVgVt(_, laneid, n_block), tVsVt(_, laneid, smem_pipe_write_v.index()));
                 } else {
                     copy(params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
-                        tVgVt(_, n_block), tVsVt(_, smem_pipe_write_v.index()));
+                        tVgVt(_, laneid, n_block), tVsVt(_, laneid, smem_pipe_write_v.index()));
                 }
             }
         }
         scheduler_prefetch();
-        if (lane_predicate) {
+        if (laneid < kCopyIters) {
             pipeline_v.producer_acquire(smem_pipe_write);
             if constexpr (size(ClusterShape{}) == 1) {
                 copy(params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
-                    tVgVt(_, n_block), tVsVt(_, smem_pipe_write.index()));
+                    tVgVt(_, laneid, n_block), tVsVt(_, laneid, smem_pipe_write.index()));
             } else {
                 copy(params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv),
-                    tVgVt(_, n_block), tVsVt(_, smem_pipe_write.index()));
+                    tVgVt(_, laneid, n_block), tVsVt(_, laneid, smem_pipe_write.index()));
             }
             ++smem_pipe_write;
         }

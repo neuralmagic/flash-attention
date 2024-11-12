@@ -10,6 +10,16 @@
 #include "cutlass/fast_math.h"  // For cutlass::FastDivmod
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// Config Options 
+//
+
+// kMaxSubPageSize: for paged KV cache, the page size must be a multiple of this
+//  value. Larger size means larger TMA transactions. 
+//  NOTE: the TileShape_N must also be a multiple of this value.
+inline constexpr int kMaxSubPageSize = 32;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct Qkv_params {
     using index_t = int64_t;

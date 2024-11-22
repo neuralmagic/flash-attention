@@ -418,21 +418,26 @@ struct CollectiveMainloopFwd {
         Tensor mK_ = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, !Varlen ? bidb : 0);
         Tensor mVt_ = params.tma_load_V.get_tma_tensor(select<1, 0, 2, 3>(params.shape_K))(_, _, bidh_kv, !Varlen ? bidb : 0);
 
-        // Compose with PagedMode if we are using a paged KV
-        auto mK = [&, bidb = bidb]() {
-            if constexpr(Use_pagedKV)
-                // mK_: ((sub_page_size, sub_page), headdim, n_heads, _1) 
-                return make_mode_paged<0, 1>(mK_, 
-                    &params.block_table[params.block_table_batch_stride * bidb],
-                    params.subpages_per_page_divmod);
-            else return mK_; }();
-        auto mVt = [&, bidb = bidb]() {
-            if constexpr(Use_pagedKV)
-                // mVt_: (headdim, (sub_page_size, sub_page), n_heads, _1) 
-                return make_mode_paged<1, 1>(mVt_,
-                    &params.block_table[params.block_table_batch_stride * bidb],
-                    params.subpages_per_page_divmod);
-            else return mVt_;  }();
+        // Bindings for pagedKV to allow us to override the subpage to be
+        //  loaded by the tma (`make_mode_overridable` saves a references to:
+        //  `tKgK_subpage_override` and `tVgVt_subpage_override`. Bit janky,
+        //  todo see if there is a cleaner way of doing this.
+        int tKgK_subpage_override = 0;
+        int tVgVt_subpage_override = 0;
+        auto set_tKgK_subpage = [&](int val) { tKgK_subpage_override = val; };
+        auto set_tVgVt_subpage = [&](int val) { tVgVt_subpage_override = val; };
+
+        auto mK = [&]() {
+            if constexpr (Use_pagedKV) 
+                return make_mode_overridable<0, 1>(mK_, tKgK_subpage_override);
+            else return mK_;
+        }();
+
+        auto mVt = [&]() {
+            if constexpr (Use_pagedKV) 
+                return make_mode_overridable<1, 1>(mVt_, tVgVt_subpage_override);
+            else return mVt_;
+        }();
 
         auto get_kv_seq_len_offset = [&, bidb=bidb]() {
             if constexpr (!Varlen || Use_pagedKV) return _0{};
@@ -461,10 +466,12 @@ struct CollectiveMainloopFwd {
         Tensor gQ_x = make_tensor(gQ.data(), make_layout(gQ.layout(), Layout<_1>{}));
         auto [tQgQ, tQsQ] = tma_partition(params.tma_load_Q, _0{}, Layout<_1>{},
                                           group_modes<0, 2>(sQ_x), group_modes<0, 2>(gQ_x));  // (TMA), (TMA)
-        auto [tKgK, tKsK] = tma_partition(params.tma_load_K, block_rank_in_cluster, Layout<ClusterShape>{},
+        auto [tKgK_, tKsK] = tma_partition(params.tma_load_K, block_rank_in_cluster, Layout<ClusterShape>{},
                                           group_modes<0, 2>(sK_tma), group_modes<0, 2>(gK_tma));  // (TMA, TMA_N_CPY, k), (TMA, TMA_N_CPY, PIPE)
         auto [tVgVt, tVsVt] = tma_partition(params.tma_load_V, block_rank_in_cluster, Layout<ClusterShape>{},
                                           group_modes<0, 2>(sVt_tma), group_modes<0, 2>(gVt_tma));  // (TMA, TMA_N_CPY, k), (TMA, TMA_N_CPY, PIPE)
+        auto tKgK = tKgK_; // Make capturable by lambda in C++17
+
 
         uint16_t mcast_mask_kv = 0;
         if constexpr (cute::is_same_v<GmemTiledCopyKV, SM90_TMA_LOAD_MULTICAST>) {
@@ -482,9 +489,30 @@ struct CollectiveMainloopFwd {
         int laneid = cutlass::canonical_lane_idx();
 
         static int constexpr kCopyIters = size<1>(TileShape_MNK{}) / TMATileShape_N{};
-        static_assert(kCopyIters <= 32, "kCopyItersV must be <= 32");
+        static_assert(kCopyIters <= 32, "kCopyIters must be <= 32");
+
+        int n_block_subpage = 0;
+        int n_block_prev_subpage = 0;
+        const int* batch_page_table = (Use_pagedKV) ? 
+            params.block_table + bidb * params.block_table_batch_stride : nullptr;
+        int subpages_per_page = (Use_pagedKV) ? params.subpages_per_page_divmod.divisor : 1;
+
+        // sets n_block_subpage and n_block_prev_subpage
+        auto resolve_next_subpage = [&](int n_block) {
+            if constexpr (Use_pagedKV) {
+                n_block_prev_subpage = n_block_subpage;
+                int subpage_idx = get_original_mode_value(tKgK, _0{}, laneid, n_block);
+                int page_idx, intra_page_subpage_idx;
+                params.subpages_per_page_divmod(page_idx, intra_page_subpage_idx, subpage_idx);
+                n_block_subpage = batch_page_table[page_idx] * subpages_per_page + intra_page_subpage_idx;
+            }
+        };
+
+        if constexpr (Use_pagedKV) resolve_next_subpage(n_block);
 
         if (laneid < kCopyIters) {
+            if constexpr (Use_pagedKV) set_tKgK_subpage(n_block_subpage);
+
             pipeline_k.producer_acquire(smem_pipe_write);
             if constexpr (size(ClusterShape{}) == 1) {
                 copy(params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
@@ -512,6 +540,12 @@ struct CollectiveMainloopFwd {
         if (laneid < kCopyIters) {
             #pragma unroll 2
             for (; n_block > n_block_min; --n_block) {
+                if constexpr (Use_pagedKV) {
+                    resolve_next_subpage(n_block - 1);
+                    set_tKgK_subpage(n_block_subpage);
+                    set_tVgVt_subpage(n_block_prev_subpage);
+                }
+
                 PipelineState smem_pipe_write_v = smem_pipe_write; // copy the state, write_v is always 1 step behind
                 ++smem_pipe_write;
                 pipeline_k.producer_acquire(smem_pipe_write);
@@ -534,6 +568,8 @@ struct CollectiveMainloopFwd {
         }
         scheduler_prefetch();
         if (laneid < kCopyIters) {
+            if constexpr (Use_pagedKV) set_tVgVt_subpage(n_block_subpage);
+ 
             pipeline_v.producer_acquire(smem_pipe_write);
             if constexpr (size(ClusterShape{}) == 1) {
                 copy(params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),

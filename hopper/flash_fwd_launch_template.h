@@ -197,7 +197,7 @@ template<typename T>
 void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
     BOOL_SWITCH(params.block_table != nullptr, Use_pagedKV, [&] {
         CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-            run_mha_fwd_dispatch<T, 128, 80, 256, Is_causal, Is_local, Use_pagedKV, true /*Enable_cluster*/>(params, stream);
+            run_mha_fwd_dispatch<T, 128, Use_pagedKV ? 64 : 80, 256, Is_causal, Is_local, Use_pagedKV, true /*Enable_cluster*/>(params, stream);
         });
     });
 }

@@ -241,12 +241,59 @@ Note: CUTLASS examples use the naming convention `tAsA` (copy-A partitioner,
 smem, tensor-A) for copy partitions. FA4 uses `tStS_t2r` style instead — see
 the naming section above.
 
-### Blackwell tmem copy: Ld32x32bOp(Repetition(R))
+### Blackwell tmem copy instructions
 
-Loads an R×32 block from tmem. With 128 threads (4 warps × 32 lanes):
-- Each warp of 32 threads reads 32 columns (one per lane)
-- `Repetition(R)` → each thread reads R rows from its column
-- With R=32 and tiling reps: covers the full (128, 128) tmem accumulator
+The `tcgen05.ld` / `tcgen05.st` instructions transfer data between tmem and
+registers. The naming is `{Ld|St}{dp}x{bits}b` where `dp` = datapath rows
+(M dimension) and `bits` = bit width read per column (N dimension).
+
+#### Load atoms (`tcgen05.ld`)
+
+| Atom                  | DP rows | Bits/col | F32 cols/thread | Align req | Use case |
+|-----------------------|---------|----------|-----------------|-----------|----------|
+| `Ld32x32bOp(Rep(R))`  | 32      | 32       | 1               | 1 byte    | General purpose, works with align=1 |
+| `Ld16x64bOp(Rep(R))`  | 16      | 64       | 2               | 2 cols    | 2× wider reads |
+| `Ld16x128bOp(Rep(R))` | 16      | 128      | 4               | 2 cols    | 4× wider reads |
+| `Ld16x256bOp(Rep(R))` | 16      | 256      | 8               | 2 cols    | 8× wider reads |
+| `Ld16x32bx2Op(Rep(R))`| 16      | 32×2     | 2 (packed)      | 2 cols    | 16b-in-32b pack |
+
+- **DP rows**: how many M-rows the atom covers per invocation
+- **Bits/col**: bits read per N-column per thread → F32 cols = bits / 32
+- **Rep(R)**: repetition factor, controls how many DP-row groups per thread
+- **Align req**: minimum tmem memref alignment (in columns). `Ld16x*` need `align>=2`,
+  `Ld32x32b` works with `align=1`. This is a CuTe DSL constraint, not HW.
+
+#### Store atoms (`tcgen05.st`)
+
+| Atom                  | DP rows | Bits/col | Notes |
+|-----------------------|---------|----------|-------|
+| `St32x32bOp(Rep(R))`  | 32      | 32       | General purpose, align=1 |
+| `St16x64bOp(Rep(R))`  | 16      | 64       | align>=2 |
+| `St16x128bOp(Rep(R))` | 16      | 128      | align>=2 |
+| `St16x256bOp(Rep(R))` | 16      | 256      | align>=2 |
+| `St16x32bx2Op(Rep(R))`| 16      | 32×2     | align>=2, 16b-in-32b pack |
+
+#### Usage pattern
+
+```python
+# Create atom + tiled copy for a tmem tensor
+atom = cute.make_copy_atom(Ld32x32bOp(Repetition(R)), F32)
+tiled_copy = tcgen05.make_tmem_copy(atom, tmem_tensor)
+thr_copy = tiled_copy.get_slice(tidx)
+
+# Partition source (tmem) and dest (registers)
+src = thr_copy.partition_S(tmem_tensor)    # (CPY, CPY_M, CPY_K)
+dst = cute.make_fragment(thr_copy.partition_D(id_tensor).shape, F32)
+cute.copy(tiled_copy, src, dst)
+```
+
+#### Choosing the right atom for a tmem shape
+
+The atom's column width must not exceed the tmem N dimension:
+- tmem (128, 128): `Ld32x32bOp(Rep(32))` — 32 cols × 4 reps = 128 ✓
+- tmem (128, 32):  `Ld32x32bOp(Rep(32))` — 32 cols × 1 rep = 32 ✓
+- tmem (128, 16):  `Ld32x32bOp` reads 32 cols → **OOB on N=16!**
+                   `Ld16x128bOp(Rep(4))` reads 16 cols → correct, but needs align≥2
 
 ### make_smem_layout_a vs make_smem_layout_b
 

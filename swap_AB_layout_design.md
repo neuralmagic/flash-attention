@@ -50,12 +50,23 @@ With native N=q_padded (no N-override):
 - sK (A): `((128,16),1,(4,2),kv_stage)` — standard 128 rows
 - tmem acc: `((128, q_padded),1,1,1)` — only q_padded columns
 
-Current approach uses N-override via `declare_ptx_idesc(n_override=q_padded)`:
-- All layouts use (128,128). N-override in idesc reduces MMA compute to q_padded.
-- Wastes smem and tmem columns but avoids layout asymmetry complexity.
+N-override approach (current):
+- All layouts/TMA use symmetric (128,128). N-override in the instruction
+  descriptor (`declare_ptx_idesc(n_override=q_padded)`) reduces MMA compute.
+- Wastes smem and tmem columns (128 allocated, only q_padded used).
 
-Native N=q_padded tiler also works (verified) but gives same perf since
-smem/tmem savings are small relative to kernel launch overhead.
+Native N=q_padded tiler (compiles, blocked by tmem alignment):
+- TMA partition fixed: swap partition_A/B for gmem Q/K/V tensors.
+- MMA, TMA, and GEMM all work with (128, 16, 128) tiler.
+- Blocked by tmem load atoms:
+  - Ld32x32bOp reads 32 N-columns, but tmem only has 16 → OOB read on columns 16..31
+  - Ld16x128bOp and Ld16x64bOp need tmem align>=2, but make_fragment_C creates align=1
+  - This is a CuTe DSL limitation (tmem memref alignment annotation)
+- When fixed: Ld16x128bOp(Rep(4)) gives ideal mapping:
+  - Each thread: all q_padded queries × some kv positions = 16 F32 values
+  - Per query: 32 threads (1 warp) with 4 kv each = 128 kv total
+  - Softmax reduces to a single warp_reduce (no cross-warp barriers!)
+  - Would eliminate all cross-warp sync overhead → big win for short sequences
 
 ### 3. TMA atoms
 

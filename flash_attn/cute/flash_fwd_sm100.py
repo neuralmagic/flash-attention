@@ -143,7 +143,7 @@ class FlashAttentionForwardSm100:
         if self.swap_AB:
             self.q_stage = 1
             self.split_P_arrive = 0  # P from smem, no split arrival
-            self.q_padded = 16       # N-override for QK MMA
+            self.q_padded = 16
         self.arch = BaseDSL._get_dsl().get_arch_enum()
         assert self.arch >= Arch.sm_100 and self.arch <= Arch.sm_110f, "Only SM 10.x and 11.x are supported"
 
@@ -152,11 +152,13 @@ class FlashAttentionForwardSm100:
         self.cta_tiler = (self.q_stage * m_block_size, n_block_size, self.head_dim_padded)
         # With 2CTA, the MMA tiler M covers both CTAs, so it's cta_group_size * m_block_size.
         # Each CTA owns m_block_size rows; the 2CTA MMA instruction spans both.
-        # Tilers always use full N=128. swap_AB uses N-override in the instruction
-        # descriptor to reduce compute to q_padded. Native N=q_padded causes JIT hangs
-        # due to asymmetric tiler in CuTe DSL.
-        self.mma_tiler_qk = (self.cta_group_size * m_block_size, n_block_size, self.head_dim_padded)
-        self.mma_tiler_pv = (self.cta_group_size * m_block_size, self.head_dim_v_padded, n_block_size)
+        if self.swap_AB:
+            # Native N=q_padded: 8x smaller smem/tmem, 8x fewer MMA ops than N=128
+            self.mma_tiler_qk = (self.cta_group_size * m_block_size, self.q_padded, self.head_dim_padded)
+            self.mma_tiler_pv = (self.cta_group_size * m_block_size, self.q_padded, n_block_size)
+        else:
+            self.mma_tiler_qk = (self.cta_group_size * m_block_size, n_block_size, self.head_dim_padded)
+            self.mma_tiler_pv = (self.cta_group_size * m_block_size, self.head_dim_v_padded, n_block_size)
         self.qk_acc_dtype = Float32
         self.pv_acc_dtype = Float32
         self.cluster_shape_mn = (2, 1) if self.use_2cta_instrs else (1, 1)
@@ -1361,26 +1363,41 @@ class FlashAttentionForwardSm100:
                 else:
                     mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, head_idx_kv])
                     mV_cur = cute.domain_offset((0, seqlen.offset_k), mV[None, None, head_idx_kv])
-                gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
-                gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
+                if const_expr(self.swap_AB):
+                    # swap_AB: K is A (tile by M,K), V is A (tile by M,K)
+                    gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[0, 2]), (None, 0))
+                    gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[0, 2]), (0, None))
+                else:
+                    gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
+                    gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
             else:
                 # Need to keep batch coord None since we'll index into it with page idx
                 mK_cur, mV_cur = [t[None, None, head_idx_kv, None] for t in (mK, mV)]
-                gK = cute.local_tile(
-                    mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0, None)
-                )
-                gV = cute.local_tile(
-                    mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None, None)
-                )
-            tSgK = thr_mma_qk.partition_B(gK)
-            tOgV = thr_mma_pv.partition_B(gV)
+                if const_expr(self.swap_AB):
+                    gK = cute.local_tile(
+                        mK_cur, cute.select(self.mma_tiler_qk, mode=[0, 2]), (None, 0, None)
+                    )
+                    gV = cute.local_tile(
+                        mV_cur, cute.select(self.mma_tiler_pv, mode=[0, 2]), (0, None, None)
+                    )
+                else:
+                    gK = cute.local_tile(
+                        mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0, None)
+                    )
+                    gV = cute.local_tile(
+                        mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None, None)
+                    )
+            tSgK = thr_mma_qk.partition_A(gK) if const_expr(self.swap_AB) else thr_mma_qk.partition_B(gK)
+            tOgV = thr_mma_pv.partition_A(gV) if const_expr(self.swap_AB) else thr_mma_pv.partition_B(gV)
             if const_expr(self.use_tma_Q):
-                tiler_gQ = ((self.mma_tiler_qk[0] * self.q_stage), self.head_dim_padded)
-                gQ = cute.local_tile(mQ_cur, tiler_gQ, (m_block, 0))  # (128 * 2, 128)
+                # swap_AB: Q is N-operand, tile by N=q_padded; standard: Q is M-operand, tile by M
+                q_tile_dim = self.mma_tiler_qk[1] if const_expr(self.swap_AB) else self.mma_tiler_qk[0]
+                tiler_gQ = ((q_tile_dim * self.q_stage), self.head_dim_padded)
+                gQ = cute.local_tile(mQ_cur, tiler_gQ, (m_block, 0))
                 gQ = layout_utils.select(
-                    cute.flat_divide(gQ, (self.mma_tiler_qk[0],)), mode=[0, 2, 1]
-                )  # (128, 128, 2)
-                tSgQ = thr_mma_qk.partition_A(gQ)
+                    cute.flat_divide(gQ, (q_tile_dim,)), mode=[0, 2, 1]
+                )
+                tSgQ = thr_mma_qk.partition_B(gQ) if const_expr(self.swap_AB) else thr_mma_qk.partition_A(gQ)
                 load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ
                 )
@@ -1578,10 +1595,10 @@ class FlashAttentionForwardSm100:
             sQ_stage_stride = 0
 
         if const_expr(self.swap_AB):
-            # swap_AB: precompute B=Q descriptor, runtime A=K. N-override for smaller compute.
+            # swap_AB: precompute B=Q descriptor, runtime A=K
             sm100_utils.declare_ptx_smem_desc(q_smem_start[self.q_stage - 1], q_smem_base, tSrQ[None, None, None, 0].layout, var_name_prefix="fa_fwd_q_smem_desc")
-            sm100_utils.declare_ptx_idesc(qk_mma_op, var_name="fa_fwd_qk_mma_idesc", n_override=self.q_padded)
-            sm100_utils.declare_ptx_idesc(pv_mma_op, var_name="fa_fwd_pv_mma_idesc", n_override=self.q_padded)
+            sm100_utils.declare_ptx_idesc(qk_mma_op, var_name="fa_fwd_qk_mma_idesc")
+            sm100_utils.declare_ptx_idesc(pv_mma_op, var_name="fa_fwd_pv_mma_idesc")
             gemm_Si = [partial(sm100_utils.gemm_ptx_precomputed_varname, self.tmem_s_offset[stage],
                                Int32(0),  # smem_desc_start_b placeholder (unused in swap_AB)
                                smem_desc_base_b=k_smem_base,  # unused in swap_AB path
@@ -1849,37 +1866,40 @@ class FlashAttentionForwardSm100:
         )
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
 
-        cta_qk_tiler = (self.mma_tiler_qk[0] // thr_mma_qk.thr_id.shape, self.mma_tiler_qk[1])
-        tSAcc = tStS[(None, None), 0, 0, stage]  # (128, 128)
-        tStScale = cute.composition(tSAcc, cute.make_layout((self.m_block_size, 1)))
-        tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
-        tScS = tScS[(None, None), 0, 0]  # (128, 128)
-        tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
-
-        tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
-        tStP_layout = cute.composition(
-            tSAcc.layout, cute.make_layout((self.m_block_size, tilePlikeFP32))
-        )
-        tStP = cute.make_tensor(tSAcc.iterator + self.tmem_s_to_p_offset, tStP_layout)
+        tSAcc = tStS[(None, None), 0, 0, stage]
 
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.qk_acc_dtype
         )
         thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tSAcc).get_slice(tidx)
-        tStS_t2r = thr_tmem_load.partition_S(tSAcc)  # (((32,32),1),1,4)
+        tStS_t2r = thr_tmem_load.partition_S(tSAcc)
 
-        tmem_store_scale_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(1)), Float32
-        )
-        thr_tmem_store_scale = tcgen05.make_tmem_copy(tmem_store_scale_atom, tStScale).get_slice(
-            tidx
-        )
-        tStScale_r2t = thr_tmem_store_scale.partition_D(tStScale)
-        tmem_store_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), Float32
-        )
-        thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP).get_slice(tidx)
-        tStP_r2t = thr_tmem_store.partition_D(tStP)  # (((16,32),1),1,4)
+        # Standard-only: P tmem store atoms (not used in swap_AB where P goes to smem)
+        thr_tmem_store = None
+        thr_tmem_store_scale = None
+        tStScale_r2t = None
+        tStP_r2t = None
+        if const_expr(not self.swap_AB):
+            cta_qk_tiler = (self.mma_tiler_qk[0] // thr_mma_qk.thr_id.shape, self.mma_tiler_qk[1])
+            tStScale = cute.composition(tSAcc, cute.make_layout((self.m_block_size, 1)))
+            tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
+            tScS = tScS[(None, None), 0, 0]
+            tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
+            tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
+            tStP_layout = cute.composition(
+                tSAcc.layout, cute.make_layout((self.m_block_size, tilePlikeFP32))
+            )
+            tStP = cute.make_tensor(tSAcc.iterator + self.tmem_s_to_p_offset, tStP_layout)
+            tmem_store_scale_atom = cute.make_copy_atom(
+                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(1)), Float32
+            )
+            thr_tmem_store_scale = tcgen05.make_tmem_copy(tmem_store_scale_atom, tStScale).get_slice(tidx)
+            tStScale_r2t = thr_tmem_store_scale.partition_D(tStScale)
+            tmem_store_atom = cute.make_copy_atom(
+                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), Float32
+            )
+            thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP).get_slice(tidx)
+            tStP_r2t = thr_tmem_store.partition_D(tStP)
 
         mma_si_consumer_phase = Int32(0)
         sm_stats_producer_phase = Int32(1)
@@ -2226,12 +2246,9 @@ class FlashAttentionForwardSm100:
             mask_fn(tSrS_t2r, n_block=n_block)
 
         if const_expr(self.swap_AB):
-            # ── swap_AB softmax: reduce across kv (128 threads) for each query ──
-            # Thread mapping from tmem Ld32x32bOp:
-            #   Each thread owns 1 kv position × q_padded query values
-            #   thread_idx → kv position, tSrS_t2r[j] → S^T[kv=tidx, q=j]
-            #   Need to reduce across all 128 threads for each query j
+            # ── swap_AB softmax: reduce across kv for each query ──
             thread_idx = thr_tmem_load.thr_idx
+
 
             # For each query q (only q_padded matters), reduce S^T[:, q] across 128 threads
             # tSrS_t2r[0] = S^T[kv=thread_idx, q=0]
@@ -2646,22 +2663,25 @@ class FlashAttentionForwardSm100:
         """
         tOcO = thr_mma.partition_C(cute.make_identity_tensor(self.mma_tiler_pv[:2]))
         corr_tile_size = 16  # tuneable parameter
+        # swap_AB: tmem N = q_padded; standard: tmem N = head_dim_v
+        tmem_n = self.mma_tiler_pv[1] if const_expr(self.swap_AB) else self.head_dim_v_padded
+        corr_tile_n = min(corr_tile_size, tmem_n)
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(corr_tile_size)), self.pv_acc_dtype
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(corr_tile_n)), self.pv_acc_dtype
         )
         tmem_store_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(corr_tile_size)),
+            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(corr_tile_n)),
             self.pv_acc_dtype,
         )
-        tOtO_i = cute.composition(tOtO, cute.make_layout((self.m_block_size, corr_tile_size)))
-        tOcO_i = cute.composition(tOcO, cute.make_layout((self.m_block_size, corr_tile_size)))
+        tOtO_i = cute.composition(tOtO, cute.make_layout((self.m_block_size, corr_tile_n)))
+        tOcO_i = cute.composition(tOcO, cute.make_layout((self.m_block_size, corr_tile_n)))
         thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tOtO_i).get_slice(tidx)
         thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tOtO_i).get_slice(tidx)
         tOtO_t2r = thr_tmem_load.partition_S(tOtO_i)
         tOrO_t2r_shape = thr_tmem_load.partition_D(tOcO_i).shape
         tOtO_r2t = thr_tmem_store.partition_D(tOtO_i)
 
-        frg_count = self.head_dim_v_padded // corr_tile_size
+        frg_count = tmem_n // corr_tile_n
         tOrO_frg = cute.make_fragment((tOrO_t2r_shape, frg_count), self.pv_acc_dtype)
         for i in cutlass.range_constexpr(frg_count):
             tOrO_frg = cute.make_fragment(tOrO_t2r_shape, self.pv_acc_dtype)
@@ -2743,10 +2763,10 @@ class FlashAttentionForwardSm100:
         tOcO_t2r = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
 
         if const_expr(self.swap_AB):
-            # swap_AB: tmem has O^T[M=hdim, N=q]. Write to sO as O[q, hdim].
-            # sO has epi layout (m_block_size, head_dim_v). Use it as (q, hdim).
-            # tmem coord (M=hdim, N=q) → sO[N, M] = sO[q, hdim]
-            for i in cutlass.range(self.head_dim_v_padded // corr_tile_size, unroll_full=True):
+            # swap_AB: tmem O^T has M=hdim rows, N=q_padded cols.
+            # Read tiles, transpose, write to sO[q, hdim].
+            n_tiles_swap = self.mma_tiler_pv[1] // corr_tile_size
+            for i in cutlass.range(n_tiles_swap, unroll_full=True):
                 tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
                 tOcO_t2r_i = tOcO_t2r[None, 0, 0, i]
                 tOrO_frg = cute.make_fragment(tOcO_t2r_i.shape, self.pv_acc_dtype)

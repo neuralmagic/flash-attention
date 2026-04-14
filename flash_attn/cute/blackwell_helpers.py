@@ -993,11 +993,8 @@ def declare_ptx_smem_desc(
 
 
 @cute.jit
-def declare_ptx_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp, var_name: str = "idesc", n_override: Optional[int] = None) -> None:
-    if const_expr(n_override is not None):
-        idesc = const_expr(sm100_desc.mma_op_to_idesc_override_n(op, n_override))
-    else:
-        idesc = const_expr(sm100_desc.mma_op_to_idesc(op))
+def declare_ptx_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp, var_name: str = "idesc") -> None:
+    idesc = const_expr(sm100_desc.mma_op_to_idesc(op))
     llvm.inline_asm(
         None,
         [],

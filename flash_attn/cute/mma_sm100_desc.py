@@ -174,6 +174,18 @@ def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
     )
 
 
+def mma_op_to_idesc_override_n(op: cute.nvgpu.tcgen05.mma.MmaOp, n_override: int):
+    return make_instr_desc(
+        op.a_dtype,
+        op.b_dtype,
+        op.acc_dtype,
+        op.shape_mnk[0],
+        n_override,
+        Major.K if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+        Major.K if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+    )
+
+
 class LayoutType(IntEnum):  # occupies the top-3 bits [61:64)
     SWIZZLE_NONE = 0  # (a.k.a. “INTERLEAVE” in older docs)
     SWIZZLE_128B_BASE32B = 1

@@ -386,6 +386,7 @@ def gemm_ptx_partial(
     # acc_offset: Int32 = 0,
     tA_addr: Optional[Int32] = None,
     cta_group: int = 1,
+    n_override: Optional[int] = None,
 ) -> None:
     # acc_tmem_addr += acc_offset
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
@@ -393,7 +394,10 @@ def gemm_ptx_partial(
         assert sA is not None, "sA must be provided when a_src is not TMEM"
     sA_layout = sA.layout if sA is not None else tCrA.layout
     sB_layout = sB.layout
-    idesc: int = const_expr(sm100_desc.mma_op_to_idesc(op))
+    if const_expr(n_override is not None):
+        idesc: int = const_expr(sm100_desc.mma_op_to_idesc_override_n(op, n_override))
+    else:
+        idesc: int = const_expr(sm100_desc.mma_op_to_idesc(op))
     if const_expr(not is_ts):
         sA_swizzle = sA.iterator.type.swizzle_type
         smem_desc_base_a: int = const_expr(

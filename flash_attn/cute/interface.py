@@ -427,9 +427,7 @@ def _flash_attn_fwd(
         softcap = None
     qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
-        # swap_AB disables pack_gqa: Q is small (decode) and pack_gqa's multi-dim
-        # stride is incompatible with B-operand TMA descriptor
-        pack_gqa = qhead_per_kvhead > 1 and not swap_AB
+        pack_gqa = qhead_per_kvhead > 1
 
     out_torch_dtype = q.dtype
     device = q.device

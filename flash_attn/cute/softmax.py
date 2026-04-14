@@ -175,8 +175,8 @@ class SoftmaxSm100(Softmax):
         scale_log2: Float32,
         rescale_threshold: cutlass.Constexpr[float] = 0.0,
         softmax_scale: Float32 | None = None,
+        num_rows: cutlass.Constexpr[int] = 1,
     ):
-        num_rows = 1
         arch = 100
         row_max = cute.make_rmem_tensor(num_rows, Float32)
         row_sum = cute.make_rmem_tensor(num_rows, Float32)

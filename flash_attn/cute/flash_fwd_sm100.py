@@ -118,6 +118,8 @@ class FlashAttentionForwardSm100:
     ):
         self.swap_AB = swap_AB
         self.use_tma_KV = not paged_kv_non_tma
+        self.qhead_per_kvhead = qhead_per_kvhead
+        self.pack_gqa = pack_gqa
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -143,7 +145,11 @@ class FlashAttentionForwardSm100:
         if self.swap_AB:
             self.q_stage = 1
             self.split_P_arrive = 0  # P from smem, no split arrival
-            self.q_padded = 16
+            # pack_gqa packs qhpk Q heads into N; round up to multiple of 8 (HW constraint)
+            if self.pack_gqa:
+                self.q_padded = ((self.qhead_per_kvhead + 7) // 8) * 8
+            else:
+                self.q_padded = 16
         self.arch = BaseDSL._get_dsl().get_arch_enum()
         assert self.arch >= Arch.sm_100 and self.arch <= Arch.sm_110f, "Only SM 10.x and 11.x are supported"
 
@@ -167,9 +173,7 @@ class FlashAttentionForwardSm100:
         self.is_local = is_local
         self.is_varlen_q = is_varlen_q
         self.use_correction_warps_for_epi = is_varlen_q
-        self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
-        self.pack_gqa = pack_gqa
         self.q_subtile_factor = q_subtile_factor
         assert not (self.is_split_kv and self.head_dim_v_padded >= 192), (
             "SplitKV is not supported for hdim >= 192"
@@ -1005,7 +1009,11 @@ class FlashAttentionForwardSm100:
         else:
             sO = cute.make_tensor(cute.recast_ptr(sQ.iterator, sO_layout.inner, self.o_dtype), sO_layout.outer)
 
-        sScale = storage.sScale.get_tensor(cute.make_layout(self.q_stage * self.m_block_size * 2))
+        if const_expr(self.swap_AB):
+            # swap_AB: per-query scales (q_padded entries per stage, ×2 for row_sum/row_max)
+            sScale = storage.sScale.get_tensor(cute.make_layout(self.q_stage * self.q_padded * 2))
+        else:
+            sScale = storage.sScale.get_tensor(cute.make_layout(self.q_stage * self.m_block_size * 2))
 
         thr_mma_qk = tiled_mma_qk.get_slice(mma_tile_coord_v)
         thr_mma_pv = tiled_mma_pv.get_slice(mma_tile_coord_v)
@@ -1032,7 +1040,8 @@ class FlashAttentionForwardSm100:
                     (self.mma_tiler_pv[1], self.n_block_size),
                 ))
             )
-            sSoftmaxScratch = storage.sSoftmaxScratch.get_tensor(cute.make_layout(4 * 32))
+            assert self.q_padded <= 32, f"swap_AB q_padded={self.q_padded} exceeds sSoftmaxScratch capacity (max 32)"
+            sSoftmaxScratch = storage.sSoftmaxScratch.get_tensor(cute.make_layout(4 * self.q_padded))
         else:
             # Standard: P is from tmem (A-operand, K-major)
             tP = cute.make_tensor(tStS.iterator, tP_layout.outer)
@@ -1613,7 +1622,8 @@ class FlashAttentionForwardSm100:
                        for stage in range(self.q_stage)]
             gemm_Pi = [partial(sm100_utils.gemm_ptx_partial, pv_mma_op, self.tmem_o_offset[stage],
                                tCrB=tOrP, sB=sP[None, None, None, 0],
-                               cta_group=self.cta_group_size)
+                               cta_group=self.cta_group_size,
+                               n_override=self.q_padded)
                        for stage in range(self.q_stage)]
         else:
             # Standard: precompute A=Q descriptor, runtime B=K
@@ -1970,6 +1980,7 @@ class FlashAttentionForwardSm100:
                 softmax_scale_log2,
                 rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0,
                 softmax_scale=softmax_scale,
+                num_rows=self.q_padded if const_expr(self.swap_AB) else 1,
             )
             softmax.reset()
 
@@ -2054,13 +2065,18 @@ class FlashAttentionForwardSm100:
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
                 if not empty_tile:
-                    sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
-                    if const_expr(mLSE is not None or learnable_sink is not None):
-                        sScale[
-                            tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
-                        ] = softmax.row_max[0]
-                    # if tidx == 0:
-                    #     cute.printf("softmax row sum stage %d: %f, row_max = %f\n", stage, softmax.row_sum[0], softmax.row_max[0])
+                    if const_expr(self.swap_AB):
+                        if tidx == 0:
+                            for j in cutlass.range_constexpr(self.q_padded):
+                                sScale[j + stage * self.q_padded] = softmax.row_sum[j]
+                                if const_expr(mLSE is not None or learnable_sink is not None):
+                                    sScale[j + stage * self.q_padded + self.q_stage * self.q_padded] = softmax.row_max[j]
+                    else:
+                        sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
+                        if const_expr(mLSE is not None or learnable_sink is not None):
+                            sScale[
+                                tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
+                            ] = softmax.row_max[0]
                     # See block_sparse_utils.py NOTE [SM100 block-sparse empty tiles: mbarrier contract].
                     # pipeline_sm_stats.producer_commit_w_index(stage)
                     sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
@@ -2125,11 +2141,18 @@ class FlashAttentionForwardSm100:
                             # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
 
                     # Dense path always writes scale / signals
-                    sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
-                    if const_expr(mLSE is not None or learnable_sink is not None):
-                        sScale[
-                            tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
-                        ] = softmax.row_max[0]
+                    if const_expr(self.swap_AB):
+                        if tidx == 0:
+                            for j in cutlass.range_constexpr(self.q_padded):
+                                sScale[j + stage * self.q_padded] = softmax.row_sum[j]
+                                if const_expr(mLSE is not None or learnable_sink is not None):
+                                    sScale[j + stage * self.q_padded + self.q_stage * self.q_padded] = softmax.row_max[j]
+                    else:
+                        sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
+                        if const_expr(mLSE is not None or learnable_sink is not None):
+                            sScale[
+                                tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
+                            ] = softmax.row_max[0]
                     # pipeline_sm_stats.producer_commit_w_index(stage)
                     sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
@@ -2249,45 +2272,51 @@ class FlashAttentionForwardSm100:
             # ── swap_AB softmax: reduce across kv for each query ──
             thread_idx = thr_tmem_load.thr_idx
 
+            # Phase 1: Intra-warp max reduction for all queries, write to scratch
+            for j in cutlass.range_constexpr(self.q_padded):
+                col_max_j = utils.warp_reduce(tSrS_t2r[j], utils.fmax)
+                sSoftmaxScratch[warp_idx + j * 4] = col_max_j
 
-            # For each query q (only q_padded matters), reduce S^T[:, q] across 128 threads
-            # tSrS_t2r[0] = S^T[kv=thread_idx, q=0]
-            # We need max/sum of tSrS_t2r[0] across all 128 threads
-
-            # Cross-warp reduction: max across 128 threads (4 warps)
             # Barrier 1: max write→read
-            col_max_new = utils.warp_reduce(tSrS_t2r[0], utils.fmax)
-            sSoftmaxScratch[warp_idx] = col_max_new
             cute.arch.barrier(barrier_id=int(NamedBarrierFwdSm100.SoftmaxCrossWarp),
                               number_of_threads=4 * cute.arch.WARP_SIZE)
-            col_max_new = sSoftmaxScratch[0]
-            for w in cutlass.range_constexpr(1, 4):
-                col_max_new = utils.fmax(col_max_new, sSoftmaxScratch[w])
 
-            # Update running max, compute correction scale
-            if const_expr(is_first):
-                col_max_safe = col_max_new if col_max_new != -Float32.inf else Float32(0.0)
-                acc_scale = Float32(0.0)
-            else:
-                col_max_old = softmax.row_max[0]
-                col_max_new = utils.fmax(col_max_new, col_max_old)
-                col_max_safe = col_max_new if col_max_new != -Float32.inf else Float32(0.0)
-                acc_scale_ = (col_max_old - col_max_safe) * softmax.scale_log2
-                acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
-            softmax.row_max[0] = col_max_new
+            # Phase 2: Cross-warp max reduction, update running max, compute correction scales
+            col_max_safe_arr = cute.make_fragment(self.q_padded, Float32)
+            acc_scale_arr = cute.make_fragment(self.q_padded, Float32)
+            for j in cutlass.range_constexpr(self.q_padded):
+                col_max_new_j = sSoftmaxScratch[0 + j * 4]
+                for w in cutlass.range_constexpr(1, 4):
+                    col_max_new_j = utils.fmax(col_max_new_j, sSoftmaxScratch[w + j * 4])
 
-            # Write correction scale + signal correction warp
+                if const_expr(is_first):
+                    col_max_safe_j = col_max_new_j if col_max_new_j != -Float32.inf else Float32(0.0)
+                    acc_scale_j = Float32(0.0)
+                else:
+                    col_max_old_j = softmax.row_max[j]
+                    col_max_new_j = utils.fmax(col_max_new_j, col_max_old_j)
+                    col_max_safe_j = col_max_new_j if col_max_new_j != -Float32.inf else Float32(0.0)
+                    acc_scale_j_ = (col_max_old_j - col_max_safe_j) * softmax.scale_log2
+                    acc_scale_j = cute.math.exp2(acc_scale_j_, fastmath=True)
+                softmax.row_max[j] = col_max_new_j
+                col_max_safe_arr[j] = col_max_safe_j
+                acc_scale_arr[j] = acc_scale_j
+
+            # Write per-query correction scales + signal correction warp
             if const_expr(not is_first):
-                sScale[thread_idx + stage * self.m_block_size] = acc_scale
+                for j in cutlass.range_constexpr(self.q_padded):
+                    if thread_idx == 0:
+                        sScale[j + stage * self.q_padded] = acc_scale_arr[j]
             sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
-            # Exp2 + write P to sP_2d + sum reduction
-            col_max_scaled = col_max_safe * softmax.scale_log2
-            exp_val = cute.math.exp2(tSrS_t2r[0] * softmax.scale_log2 - col_max_scaled, fastmath=True)
-            tSrS_t2r[0] = exp_val
-            sP_2d[0, thread_idx] = self.v_dtype(exp_val)
-            col_sum = utils.warp_reduce(exp_val, lambda a, b: a + b)
-            sSoftmaxScratch[warp_idx] = col_sum
+            # Phase 3: Exp2 + write P to sP_2d + intra-warp sum reduction
+            for j in cutlass.range_constexpr(self.q_padded):
+                col_max_scaled_j = col_max_safe_arr[j] * softmax.scale_log2
+                exp_val_j = cute.math.exp2(tSrS_t2r[j] * softmax.scale_log2 - col_max_scaled_j, fastmath=True)
+                tSrS_t2r[j] = exp_val_j
+                sP_2d[j, thread_idx] = self.v_dtype(exp_val_j)
+                col_sum_j = utils.warp_reduce(exp_val_j, lambda a, b: a + b)
+                sSoftmaxScratch[warp_idx + j * 4] = col_sum_j
 
             # Barrier 2: sP fence + sum write→read (merged)
             cute.arch.fence_view_async_shared()
@@ -2297,15 +2326,16 @@ class FlashAttentionForwardSm100:
             # Signal MMA warp: P is ready in sP
             pipeline_s_p_o.consumer_release_w_index(stage)
 
-            # Read sum from scratch (already written before barrier 2)
+            # Phase 4: Cross-warp sum reduction, update row_sum
             pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
-            col_sum = sSoftmaxScratch[0]
-            for w in cutlass.range_constexpr(1, 4):
-                col_sum = col_sum + sSoftmaxScratch[w]
-            if const_expr(is_first):
-                softmax.row_sum[0] = col_sum
-            else:
-                softmax.row_sum[0] = softmax.row_sum[0] * acc_scale + col_sum
+            for j in cutlass.range_constexpr(self.q_padded):
+                col_sum_j = sSoftmaxScratch[0 + j * 4]
+                for w in cutlass.range_constexpr(1, 4):
+                    col_sum_j = col_sum_j + sSoftmaxScratch[w + j * 4]
+                if const_expr(is_first):
+                    softmax.row_sum[j] = col_sum_j
+                else:
+                    softmax.row_sum[j] = softmax.row_sum[j] * acc_scale_arr[j] + col_sum_j
         else:
             # ── Standard softmax: row-wise reduction (intra-thread) ──
             row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
@@ -2456,18 +2486,21 @@ class FlashAttentionForwardSm100:
                         # wait for S0 / S1
                         # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
                         sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
-                        # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
-                        # cute.arch.fence_view_async_tmem_load()
-                        # scale = tSrScale_t2r[0]
-                        scale = sScale[tidx + stage * self.m_block_size]
-                        should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
-                        # should_rescale = True
-                        # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
-                        # Don't need O_full anymore, since by the time softmax has signaled the correction
-                        # warps, S_i must have been done, so O_i-1 must have been done as well.
-                        # pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
-                        if should_rescale:
-                            self.correction_rescale(thr_mma_pv, tOtO[None, None, None, stage], tidx, scale)
+                        if const_expr(self.swap_AB):
+                            # Per-query correction scales
+                            scales = cute.make_fragment(self.q_padded, Float32)
+                            should_rescale_any = False
+                            for j in cutlass.range_constexpr(self.q_padded):
+                                scales[j] = sScale[j + stage * self.q_padded]
+                                if scales[j] < Float32(1.0):
+                                    should_rescale_any = True
+                            if should_rescale_any:
+                                self.correction_rescale_swap_AB(thr_mma_pv, tOtO[None, None, None, stage], tidx, scales)
+                        else:
+                            scale = sScale[tidx + stage * self.m_block_size]
+                            should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
+                            if should_rescale:
+                                self.correction_rescale(thr_mma_pv, tOtO[None, None, None, stage], tidx, scale)
                         # Notify mma warp that O has been rescaled
                         pipeline_s_p_o.consumer_release_w_index(stage)
                         pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
@@ -2494,30 +2527,39 @@ class FlashAttentionForwardSm100:
                 for stage in cutlass.range_constexpr(self.q_stage):
                     # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
                     sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
-                    # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
-                    # cute.arch.fence_view_async_tmem_load()
-                    # scale = tSrScale_t2r[0]
-                    row_sum = sScale[tidx + stage * self.m_block_size]
-                    if const_expr(mLSE is not None or learnable_sink is not None):
-                        row_max = sScale[tidx + stage * self.m_block_size + self.q_stage * self.m_block_size]
-                    else:
-                        row_max = None
                     pipeline_sm_stats.consumer_release_w_index(stage)
-                    if const_expr(learnable_sink is not None):
-                        LOG2_E = math.log2(math.e)
-                        sink_val = learnable_sink_val[stage]
-                        if const_expr(not self.is_split_kv) or split_idx == 0:
-                            if row_max == -Float32.inf:
-                                # It's possible to have an empty row with splitKV.
-                                row_max = sink_val * (LOG2_E / softmax_scale_log2)
-                                row_sum = Float32(1.0)
-                            else:
-                                row_sum += cute.math.exp2(
-                                    sink_val * LOG2_E - row_max * softmax_scale_log2, fastmath=True
-                                )
-                    acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
-                    stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
-                    scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+                    if const_expr(self.swap_AB):
+                        # Per-query final scales
+                        epi_scales = cute.make_fragment(self.q_padded, Float32)
+                        for j in cutlass.range_constexpr(self.q_padded):
+                            row_sum_j = sScale[j + stage * self.q_padded]
+                            acc_O_mn_row_is_zero_or_nan_j = row_sum_j == 0.0 or row_sum_j != row_sum_j
+                            epi_scales[j] = cute.arch.rcp_approx(
+                                row_sum_j if not acc_O_mn_row_is_zero_or_nan_j else Float32(1.0)
+                            )
+                        # stats[stage] not used for swap_AB — LSE is written directly from sScale
+                        scale = Float32(1.0)  # unused, per-query scales in epi_scales
+                    else:
+                        row_sum = sScale[tidx + stage * self.m_block_size]
+                        if const_expr(mLSE is not None or learnable_sink is not None):
+                            row_max = sScale[tidx + stage * self.m_block_size + self.q_stage * self.m_block_size]
+                        else:
+                            row_max = None
+                        if const_expr(learnable_sink is not None):
+                            LOG2_E = math.log2(math.e)
+                            sink_val = learnable_sink_val[stage]
+                            if const_expr(not self.is_split_kv) or split_idx == 0:
+                                if row_max == -Float32.inf:
+                                    row_max = sink_val * (LOG2_E / softmax_scale_log2)
+                                    row_sum = Float32(1.0)
+                                else:
+                                    row_sum += cute.math.exp2(
+                                        sink_val * LOG2_E - row_max * softmax_scale_log2, fastmath=True
+                                    )
+                        acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
+                        stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
+                        scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+                        epi_scales = None
                     # Wait for the last O to be ready from the MMA warp
                     pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
                     if const_expr(not self.use_correction_warps_for_epi):
@@ -2535,13 +2577,13 @@ class FlashAttentionForwardSm100:
                         mO_cur,
                         gO_stage,
                         gmem_tiled_copy_O,
+                        scales=epi_scales,
                     )
                     # Signal for the next work tile that O buffers in tmem are already read, so
                     # mma warp can write to them
                     pipeline_s_p_o.consumer_release_w_index(stage)
                     if const_expr(not self.use_correction_warps_for_epi):
                         pipeline_o_epi.producer_commit_w_index(stage)
-                    # if tidx == 0: cute.printf("Correction final scale for stage %d: %f\n", stage, scale)
 
                 o_corr_consumer_phase ^= 1
                 sm_stats_consumer_phase ^= 1
@@ -2603,35 +2645,62 @@ class FlashAttentionForwardSm100:
                         mLSE_cur = cute.domain_offset((offset,), mLSE[None, head_idx])
                 for stage in cutlass.range_constexpr(self.q_stage):
                     m_tile_idx = (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
-                    row_sum, row_max, acc_O_mn_row_is_zero_or_nan = stats[stage]
-                    # if tidx == 0 and stage <= 1:
-                    #     cute.printf("row_sum = {}, row_max = {}, acc_O_mn_row_is_zero_or_nan = {}\n", row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     LN2 = math.log(2.0)
-                    lse = (
-                        (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2
-                        if not acc_O_mn_row_is_zero_or_nan
-                        else -Float32.inf
-                    )
-                    seqlen_q = (
-                        seqlen.seqlen_q
-                        if const_expr(not self.pack_gqa)
-                        else seqlen.seqlen_q * self.qhead_per_kvhead
-                    )
-                    if const_expr(not self.pack_gqa or self.m_block_size % self.qhead_per_kvhead == 0):
-                        gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_tile_idx,))
-                        if tidx < seqlen_q - m_tile_idx * self.m_block_size:
-                            # This actually just works with PackGQA too
-                            gLSE[tidx] = lse
+                    if const_expr(self.swap_AB):
+                        # Per-query LSE from sScale (all threads see the same values)
+                        seqlen_q_packed = (
+                            seqlen.seqlen_q
+                            if const_expr(not self.pack_gqa)
+                            else seqlen.seqlen_q * self.qhead_per_kvhead
+                        )
+                        if tidx == 0:
+                            for j in cutlass.range_constexpr(self.q_padded):
+                                row_sum_j = sScale[j + stage * self.q_padded]
+                                row_max_j = sScale[j + stage * self.q_padded + self.q_stage * self.q_padded]
+                                acc_O_mn_row_is_zero_or_nan_j = row_sum_j == 0.0 or row_sum_j != row_sum_j
+                                lse_j = (
+                                    (row_max_j * softmax_scale_log2 + cute.math.log2(row_sum_j, fastmath=True)) * LN2
+                                    if not acc_O_mn_row_is_zero_or_nan_j
+                                    else -Float32.inf
+                                )
+                                idx = m_tile_idx * self.m_block_size + j
+                                if idx < seqlen_q_packed:
+                                    if const_expr(self.pack_gqa):
+                                        m_idx = idx // self.qhead_per_kvhead
+                                        h_idx = idx - m_idx * self.qhead_per_kvhead
+                                        lse_ptr_i64 = utils.elem_pointer(mLSE_cur, ((h_idx, m_idx),)).toint()
+                                    else:
+                                        lse_ptr_i64 = utils.elem_pointer(mLSE_cur, (idx,)).toint()
+                                    lse_gmem_ptr = cute.make_ptr(
+                                        mLSE_cur.element_type, lse_ptr_i64, cute.AddressSpace.gmem, assumed_align=4
+                                    )
+                                    cute.make_tensor(lse_gmem_ptr, (1,))[0] = lse_j
                     else:
-                        idx = m_tile_idx * self.m_block_size + tidx
-                        if idx < seqlen_q:
-                            m_idx = idx // self.qhead_per_kvhead
-                            h_idx = idx - m_idx * self.qhead_per_kvhead
-                            lse_ptr_i64 = utils.elem_pointer(mLSE_cur, ((h_idx, m_idx),)).toint()
-                            lse_gmem_ptr = cute.make_ptr(
-                                mLSE_cur.element_type, lse_ptr_i64, cute.AddressSpace.gmem, assumed_align=4
-                            )
-                            cute.make_tensor(lse_gmem_ptr, (1,))[0] = lse
+                        row_sum, row_max, acc_O_mn_row_is_zero_or_nan = stats[stage]
+                        lse = (
+                            (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2
+                            if not acc_O_mn_row_is_zero_or_nan
+                            else -Float32.inf
+                        )
+                        seqlen_q = (
+                            seqlen.seqlen_q
+                            if const_expr(not self.pack_gqa)
+                            else seqlen.seqlen_q * self.qhead_per_kvhead
+                        )
+                        if const_expr(not self.pack_gqa or self.m_block_size % self.qhead_per_kvhead == 0):
+                            gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_tile_idx,))
+                            if tidx < seqlen_q - m_tile_idx * self.m_block_size:
+                                gLSE[tidx] = lse
+                        else:
+                            idx = m_tile_idx * self.m_block_size + tidx
+                            if idx < seqlen_q:
+                                m_idx = idx // self.qhead_per_kvhead
+                                h_idx = idx - m_idx * self.qhead_per_kvhead
+                                lse_ptr_i64 = utils.elem_pointer(mLSE_cur, ((h_idx, m_idx),)).toint()
+                                lse_gmem_ptr = cute.make_ptr(
+                                    mLSE_cur.element_type, lse_ptr_i64, cute.AddressSpace.gmem, assumed_align=4
+                                )
+                                cute.make_tensor(lse_gmem_ptr, (1,))[0] = lse
 
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
@@ -2696,6 +2765,50 @@ class FlashAttentionForwardSm100:
         cute.arch.fence_view_async_tmem_store()
 
     @cute.jit
+    def correction_rescale_swap_AB(
+        self,
+        thr_mma: cute.core.ThrMma,
+        tOtO: cute.Tensor,
+        tidx: Int32,
+        scales: cute.Tensor,
+    ):
+        """Per-query rescaling for swap_AB mode.
+
+        Each N-column (query) in tmem O^T gets its own scale factor.
+        Uses coordinate tensor to determine the query index per element.
+        q_padded must be <= corr_tile_size (16) so a single tile covers all queries.
+        """
+        tOcO = thr_mma.partition_C(cute.make_identity_tensor(self.mma_tiler_pv[:2]))
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.q_padded)), self.pv_acc_dtype
+        )
+        tmem_store_atom = cute.make_copy_atom(
+            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(self.q_padded)),
+            self.pv_acc_dtype,
+        )
+        tOtO_i = cute.composition(tOtO, cute.make_layout((self.m_block_size, self.q_padded)))
+        tOcO_i = cute.composition(tOcO, cute.make_layout((self.m_block_size, self.q_padded)))
+        thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tOtO_i).get_slice(tidx)
+        thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tOtO_i).get_slice(tidx)
+        tOtO_t2r = thr_tmem_load.partition_S(tOtO_i)
+        tOcO_t2r = thr_tmem_load.partition_D(tOcO_i)
+        tOrO_t2r_shape = tOcO_t2r.shape
+        tOtO_r2t = thr_tmem_store.partition_D(tOtO_i)
+
+        # Single tile (i=0): no iterator advancement needed
+        tOrO_frg = cute.make_fragment(tOrO_t2r_shape, self.pv_acc_dtype)
+        cute.copy(thr_tmem_load, tOtO_t2r, tOrO_frg)
+        for j in cutlass.range(0, cute.size(tOrO_frg), unroll_full=True):
+            n_idx = tOcO_t2r[j][1]
+            scale_j = Float32(1.0)
+            for q in cutlass.range_constexpr(self.q_padded):
+                if n_idx == q:
+                    scale_j = scales[q]
+            tOrO_frg[j] = tOrO_frg[j] * scale_j
+        cute.copy(thr_tmem_store, tOrO_frg, tOtO_r2t)
+        cute.arch.fence_view_async_tmem_store()
+
+    @cute.jit
     def correction_epilogue(
         self,
         thr_mma: cute.core.ThrMma,
@@ -2709,6 +2822,7 @@ class FlashAttentionForwardSm100:
         mO_cur: Optional[cute.Tensor] = None,
         gO: Optional[cute.Tensor] = None,
         gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
+        scales: Optional[cute.Tensor] = None,
     ):
         """Apply final scaling and transformation to attention output before writing to global memory.
 
@@ -2733,7 +2847,7 @@ class FlashAttentionForwardSm100:
         :type sO: cute.Tensor
         """
 
-        corr_tile_size = 8 * 32 // self.o_dtype.width
+        corr_tile_size = self.q_padded if const_expr(self.swap_AB) else 8 * 32 // self.o_dtype.width
         # Use CTA 0 mapping for smem partitioning since sO is per-CTA sized
         tOsO = thr_mma.get_slice(0).partition_C(sO)
         tOcO = thr_mma.partition_C(cute.make_identity_tensor(self.mma_tiler_pv[:2]))
@@ -2771,15 +2885,18 @@ class FlashAttentionForwardSm100:
                 tOcO_t2r_i = tOcO_t2r[None, 0, 0, i]
                 tOrO_frg = cute.make_fragment(tOcO_t2r_i.shape, self.pv_acc_dtype)
                 cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
-                for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
-                    tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
-                        (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale)
-                    )
                 for j in cutlass.range(0, cute.size(tOrO_frg), unroll_full=True):
                     hdim_idx = tOcO_t2r_i[j][0]  # M = hdim
                     q_idx = tOcO_t2r_i[j][1]      # N = query
-                    # Write to sO[q, hdim] — sO uses standard (row, col) layout
-                    sO[q_idx, hdim_idx] = self.o_dtype(tOrO_frg[j])
+                    if const_expr(scales is not None):
+                        # Per-query scaling via coordinate lookup
+                        scale_j = Float32(1.0)
+                        for q in cutlass.range_constexpr(self.q_padded):
+                            if q_idx == q:
+                                scale_j = scales[q]
+                        sO[q_idx, hdim_idx] = self.o_dtype(tOrO_frg[j] * scale_j)
+                    else:
+                        sO[q_idx, hdim_idx] = self.o_dtype(tOrO_frg[j] * scale)
         else:
             for i in cutlass.range(self.head_dim_v_padded // corr_tile_size, unroll_full=True):
                 tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]

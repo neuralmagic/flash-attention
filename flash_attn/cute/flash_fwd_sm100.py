@@ -147,9 +147,9 @@ class FlashAttentionForwardSm100:
             self.split_P_arrive = 0  # P from smem, no split arrival
             # pack_gqa packs qhpk Q heads into N; round up to multiple of 8 (HW constraint)
             if self.pack_gqa:
-                self.q_padded = max(((self.qhead_per_kvhead + 7) // 8) * 8, 16)  # min 16: N<16 causes wrong PV GEMM output
+                self.q_padded = ((self.qhead_per_kvhead + 7) // 8) * 8
             else:
-                self.q_padded = 16
+                self.q_padded = 8
         self.arch = BaseDSL._get_dsl().get_arch_enum()
         assert self.arch >= Arch.sm_100 and self.arch <= Arch.sm_110f, "Only SM 10.x and 11.x are supported"
 

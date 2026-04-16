@@ -147,7 +147,7 @@ class FlashAttentionForwardSm100:
             self.split_P_arrive = 0  # P from smem, no split arrival
             # pack_gqa packs qhpk Q heads into N; round up to multiple of 8 (HW constraint)
             if self.pack_gqa:
-                self.q_padded = ((self.qhead_per_kvhead + 7) // 8) * 8
+                self.q_padded = max(((self.qhead_per_kvhead + 7) // 8) * 8, 16)  # min 16: N<16 causes wrong PV GEMM output
             else:
                 self.q_padded = 16
         self.arch = BaseDSL._get_dsl().get_arch_enum()
@@ -1207,6 +1207,7 @@ class FlashAttentionForwardSm100:
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
                 sP=sP,
+                sP_2d=sP_2d,
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
@@ -1575,6 +1576,7 @@ class FlashAttentionForwardSm100:
         blocksparse_tensors: Optional[BlockSparseTensors],
         tile_scheduler=None,
         sP: Optional[cute.Tensor] = None,
+        sP_2d: Optional[cute.Tensor] = None,
     ):
         qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
 
@@ -2066,7 +2068,7 @@ class FlashAttentionForwardSm100:
                 )
                 if not empty_tile:
                     if const_expr(self.swap_AB):
-                        if tidx == 0:
+                        if tidx % cute.arch.WARP_SIZE == 0:
                             for j in cutlass.range_constexpr(self.q_padded):
                                 sScale[j + stage * self.q_padded] = softmax.row_sum[j]
                                 if const_expr(mLSE is not None or learnable_sink is not None):
@@ -2142,7 +2144,7 @@ class FlashAttentionForwardSm100:
 
                     # Dense path always writes scale / signals
                     if const_expr(self.swap_AB):
-                        if tidx == 0:
+                        if tidx % cute.arch.WARP_SIZE == 0:
                             for j in cutlass.range_constexpr(self.q_padded):
                                 sScale[j + stage * self.q_padded] = softmax.row_sum[j]
                                 if const_expr(mLSE is not None or learnable_sink is not None):
@@ -2302,10 +2304,14 @@ class FlashAttentionForwardSm100:
                 col_max_safe_arr[j] = col_max_safe_j
                 acc_scale_arr[j] = acc_scale_j
 
-            # Write per-query correction scales + signal correction warp
+            # Write per-query correction scales + signal correction warp.
+            # Each warp's lane 0 writes (not just thread 0 of warp 0) because
+            # sm_stats_barrier is per-warp: correction warp W only synchronizes
+            # with softmax warp W's barrier. If only warp 0 writes, correction
+            # warps 1-3 may read stale sScale values.
             if const_expr(not is_first):
                 for j in cutlass.range_constexpr(self.q_padded):
-                    if thread_idx == 0:
+                    if thread_idx % cute.arch.WARP_SIZE == 0:
                         sScale[j + stage * self.q_padded] = acc_scale_arr[j]
             sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
@@ -2487,15 +2493,14 @@ class FlashAttentionForwardSm100:
                         # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
                         sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
                         if const_expr(self.swap_AB):
-                            # Per-query correction scales
                             scales = cute.make_fragment(self.q_padded, Float32)
-                            should_rescale_any = False
+                            should_rescale = False
                             for j in cutlass.range_constexpr(self.q_padded):
                                 scales[j] = sScale[j + stage * self.q_padded]
-                                if scales[j] < Float32(1.0):
-                                    should_rescale_any = True
-                            if should_rescale_any:
-                                self.correction_rescale_swap_AB(thr_mma_pv, tOtO[None, None, None, stage], tidx, scales)
+                                should_rescale = should_rescale or scales[j] < 1.0
+                            if should_rescale:
+                                self.correction_rescale_swap_AB(
+                                    thr_mma_pv, tOtO[None, None, None, stage], tidx, scales)
                         else:
                             scale = sScale[tidx + stage * self.m_block_size]
                             should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
@@ -2889,7 +2894,6 @@ class FlashAttentionForwardSm100:
                     hdim_idx = tOcO_t2r_i[j][0]  # M = hdim
                     q_idx = tOcO_t2r_i[j][1]      # N = query
                     if const_expr(scales is not None):
-                        # Per-query scaling via coordinate lookup
                         scale_j = Float32(1.0)
                         for q in cutlass.range_constexpr(self.q_padded):
                             if q_idx == q:
